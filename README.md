@@ -19,8 +19,10 @@ The tool operates on a deterministic derivation pipeline:
 
 1.  **Sealing (Setup Phase):**
     *   A high-entropy 32-byte seed is generated or provided by the user.
-    *   This seed is "sealed" into the TPM's NVRAM at a persistent handle (`0x81000001`).
+    *   The tool discovers a free persistent handle in the TPM module (defaulting to `0x81006969` or user provided).
+    *   This seed is "sealed" into the TPM's NVRAM at that handle.
     *   The seal is protected by a user-defined **TPM PIN**.
+    *   The handle address is saved to `~/.ssh/tpm2/handle.txt`.
 2.  **Unsealing (Login Phase):**
     *   The user provides the TPM PIN.
     *   The TPM verifies the PIN and system integrity, then releases the raw 32-byte seed into RAM.
@@ -35,7 +37,8 @@ The tool operates on a deterministic derivation pipeline:
     *   The public key is written to `~/.ssh/tpm2/id_{username}_{alg}_tpm2.pub` for Git compatibility.
 
 ## 📋 Requirements
-*   **Arch Linux** (or similar) with a functional TPM 2.0 chip.
+
+*   **Linux** with a functional TPM 2.0 chip.
 *   **Packages:** `tpm2-tools`, `openssh`.
 *   **Permissions:** User must be in the `tss` group to access `/dev/tpmrm0`.
 
@@ -91,13 +94,13 @@ The **32-byte master seed** is the ultimate root of your identity. If you have t
 
 ### What happens if I reinstall my OS?
 
-As long as the TPM hasn't been cleared, your secret is still safe in handle `0x81000001`. Simply reinstall the requirements and run `tpm2ssh --login`. No "restoration" of the seed is needed - it's already in the hardware.
+As long as the TPM hasn't been cleared, your seed is still safe in its hardware slot. Simply reinstall the requirements, ensure `~/.ssh/tpm2/handle.txt` contains the correct hex handle (or let the tool rediscover it if you remember the range), and run `tpm2ssh --login`. No "restoration" of the seed is needed - it's already in the hardware.
 
 ### More about the security of pieces
 
-###  The "TPM handle" is just an "Address"
+#### The "TPM handle" is just an "Address"
 
-A TPM handle is like a filename or a memory address. Knowing that your secret is at `0x81006969` is exactly the same as an attacker knowing your private key is at `~/.ssh/id_ed25519`. They can see the file exists, but they cannot read its contents.
+A TPM handle is like a filename or a memory address. Knowing that your seed is at `0x81006969` is exactly the same as an attacker knowing your private key is at `~/.ssh/id_ed25519`. They can see the file exists, but they cannot read its contents.
 
 #### Why Root/Sudo Access isn't enough
 
@@ -112,9 +115,3 @@ You might worry that an attacker with the handle could just keep guessing the PI
 
 *   **TPM Lockout:** All modern TPM 2.0 chips have built-in Dictionary Attack Protection. If someone tries the wrong PIN a few times (usually 3–10), the TPM will lock itself for a period of time (or until a physical reboot/cooldown). 
 *   **Hardware Speed:** Because the PIN is checked inside the hardware, an attacker can't use their powerful GPU or CPU to guess millions of PINs per second. They are limited by the physical speed of the TPM chip, which is intentionally slow.
-
-#### Remote Attack Vector?
-
-If an attacker has root access, their best move isn't attacking the TPM handle; it's Keylogging. They would install a logger to steal your PIN the next time you type it in. 
-
-**Note:** This is why your plan to eventually move the PIN entry to a secure TTY (Option B from earlier) is safer than a GUI popup, as it's harder for standard malware to intercept raw TTY input.
