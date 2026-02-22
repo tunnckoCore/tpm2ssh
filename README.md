@@ -9,9 +9,9 @@
 The primary goal is to achieve a "Stateless Security" model for developer identities:
 
 1.  **Eliminate Disk Forensics:** By deriving the key mathematically in RAM, there is no private key file for an attacker to steal from your filesystem.
-2.  **Hardware Binding:** The root secret is "sealed" into the TPM, meaning it cannot be used on any other machine, even if your entire drive is cloned.
+2.  **Hardware Binding:** The root secret is "sealed" into the TPM, meaning it cannot be used on any other machine, even if your entire drive is cloned or stolen.
 3.  **Unified Identity:** One hardware-backed key for both SSH (GitHub/Server access) and Git Commit Signing.
-4.  **Zero-Prompt Workflow:** Seamless integration with standard OpenSSH agents, bypassing the clunky GPG/KWallet prompt loops.
+4.  **Zero-Prompt Workflow:** Seamless integration with standard OpenSSH agents, bypassing the clunky GPG/KWallet or keyrings.
 
 ## 🛠 How It Works (The Protocol)
 
