@@ -2,10 +2,10 @@ use hkdf::Hkdf;
 use p256::SecretKey;
 use rpassword::prompt_password;
 use sha2::Sha256;
-use ssh_key::{PrivateKey, private::EcdsaKeypair, private::KeypairData};
+use ssh_key::{PrivateKey, private::EcdsaKeypair, private::Ed25519Keypair, private::KeypairData};
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::process::{Command, Stdio};
 
 fn get_stdio(verbose: bool) -> Stdio {
@@ -16,10 +16,23 @@ fn get_stdio(verbose: bool) -> Stdio {
     }
 }
 
+fn prompt(question: &str, default: &str) -> String {
+    print!("{} [{}]: ", question, default);
+    io::stdout().flush().unwrap();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        default.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn setup(verbose: bool) {
     let home = env::var("HOME").expect("HOME not set");
     let tpm_dir = format!("{}/.ssh/tpm2", home);
-    fs::create_dir_all(&tpm_dir).unwrap();
+    fs::create_dir_all("{}/.ssh/tpm2").unwrap();
 
     let pin = prompt_password("Enter new TPM PIN: ").unwrap();
     let pin_confirm = prompt_password("Confirm TPM PIN: ").unwrap();
@@ -28,17 +41,50 @@ fn setup(verbose: bool) {
         std::process::exit(1);
     }
 
+    let seed_hex = prompt(
+        "Provide 32-byte hex seed to import? (Leave empty for new)",
+        "",
+    );
+    let seed_bytes = if !seed_hex.is_empty() {
+        match hex::decode(seed_hex.trim()) {
+            Ok(bytes) => {
+                if bytes.len() != 32 {
+                    eprintln!("Error: Seed must be exactly 32 bytes (64 hex characters).");
+                    std::process::exit(1);
+                }
+                bytes
+            }
+            Err(e) => {
+                eprintln!("Error decoding hex seed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("Generating secure seed...");
+        let output = Command::new("tpm2_getrandom")
+            .args(&["32"])
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            eprintln!("Failed to generate random seed from TPM.");
+            std::process::exit(1);
+        }
+        output.stdout
+    };
+
+    let show_seed = prompt("Show final seed for backup? (y/N)", "n").to_lowercase() == "y";
+    if show_seed {
+        println!("---- SEED BACKUP (HEX) ----");
+        println!("{}", hex::encode(&seed_bytes));
+        println!("---------------------------");
+    }
+
+    let seed_path = format!("{}/seed.dat", tpm_dir);
+    fs::write(&seed_path, &seed_bytes).unwrap();
+
     println!("Creating primary context...");
     Command::new("tpm2_createprimary")
         .args(&["-c", &format!("{}/primary.ctx", tpm_dir)])
-        .stdout(get_stdio(verbose))
-        .stderr(get_stdio(verbose))
-        .status()
-        .unwrap();
-
-    println!("Generating secure seed...");
-    Command::new("tpm2_getrandom")
-        .args(&["32", "-o", &format!("{}/seed.dat", tpm_dir)])
         .stdout(get_stdio(verbose))
         .stderr(get_stdio(verbose))
         .status()
@@ -52,7 +98,7 @@ fn setup(verbose: bool) {
             "-p",
             &pin,
             "-i",
-            &format!("{}/seed.dat", tpm_dir),
+            &seed_path,
             "-u",
             &format!("{}/seal.pub", tpm_dir),
             "-r",
@@ -114,7 +160,7 @@ fn setup(verbose: bool) {
     if status.success() {
         println!("TPM Setup complete! You can now use --login.");
         // Clean up
-        let _ = fs::remove_file(format!("{}/seed.dat", tpm_dir));
+        let _ = fs::remove_file(&seed_path);
         let _ = fs::remove_file(format!("{}/primary.ctx", tpm_dir));
         let _ = fs::remove_file(format!("{}/seal.ctx", tpm_dir));
         let _ = fs::remove_file(format!("{}/seal.priv", tpm_dir));
@@ -126,6 +172,15 @@ fn setup(verbose: bool) {
 }
 
 fn login(verbose: bool) {
+    let username = prompt("Identity username", &whoami::username().unwrap());
+
+    println!("Choose algorithm:");
+    println!("1: NIST P-256 (nistp256r1, p256, passkey)");
+    println!("2: Ed25519 (ed, ed25519)");
+    let alg_choice = prompt("Algorithm", "1");
+
+    let show_priv = prompt("Show private key for backup? (y/N)", "n").to_lowercase() == "y";
+
     let seed = {
         let pin = match prompt_password("Enter TPM PIN: ") {
             Ok(p) => p,
@@ -145,34 +200,53 @@ fn login(verbose: bool) {
         output.stdout
     };
 
-    let hkdf = Hkdf::<Sha256>::new(Some(&b"tmp2-based-passkeys"[..]), &seed);
+    let hkdf = Hkdf::<Sha256>::new(Some(&b"tpm2ssh-v1-based-keys"[..]), &seed);
     let mut expanded_key_material = [0u8; 32];
     hkdf.expand(b"charlike-tpm2ssh-info", &mut expanded_key_material)
         .unwrap();
 
-    let secret_key = SecretKey::from_slice(&expanded_key_material).unwrap();
-    let public_key_ec = secret_key.public_key();
-
-    let ecdsa_keypair = EcdsaKeypair::NistP256 {
-        private: secret_key.into(),
-        public: public_key_ec.into(),
+    let (keypair_data, alg_name, comment) = if ["2", "ed", "ed25519"].contains(&alg_choice.as_str())
+    {
+        let ed25519_keypair = Ed25519Keypair::from_seed(&expanded_key_material);
+        (
+            KeypairData::from(ed25519_keypair),
+            "ed25519",
+            "tpm2ssh-ed25519-derived-key",
+        )
+    } else {
+        let secret_key = SecretKey::from_slice(&expanded_key_material).unwrap();
+        let public_key_ec = secret_key.public_key();
+        let ecdsa_keypair = EcdsaKeypair::NistP256 {
+            private: secret_key.into(),
+            public: public_key_ec.into(),
+        };
+        (
+            KeypairData::from(ecdsa_keypair),
+            "nistp256",
+            "tpm2ssh-nistp256-derived-key",
+        )
     };
 
-    let keypair_data = KeypairData::from(ecdsa_keypair);
-    // Add the comment "tpm2-derived-key"
-    let private_key = PrivateKey::new(keypair_data, "tpm2-derived-key").unwrap();
+    let private_key = PrivateKey::new(keypair_data, comment).unwrap();
     let openssh_pem = private_key.to_openssh(ssh_key::LineEnding::LF).unwrap();
 
-    // Write public key to file for Git signing
+    // Write public key to file
     let home = env::var("HOME").expect("HOME not set");
-    let pub_key_path = format!("{}/.ssh/tpm2/id_nistp256_tpm.pub", home);
+    let pub_key_filename = format!("id_{}_{}_tpm2.pub", username, alg_name);
+    let pub_key_path = format!("{}/.ssh/tpm2/{}", home, pub_key_filename);
+
     let public_key = private_key.public_key();
-    let public_key_ssh = public_key.to_openssh().unwrap();
+    let mut public_key_ssh = public_key.to_openssh().unwrap();
+    // Ensure trailing newline
+    if !public_key_ssh.ends_with('\n') {
+        public_key_ssh.push('\n');
+    }
     fs::write(&pub_key_path, public_key_ssh).expect("Failed to write public key file");
 
-    println!("---- THIS IS YOUR PRIVATE KEY: NO NEED TO SAVE IT BUT JUST IN CASE ----");
-    println!("");
-    println!("{}", openssh_pem.to_string());
+    if show_priv {
+        println!("");
+        println!("{}", openssh_pem.to_string());
+    }
 
     // Pipe it into ssh-add
     let socket = format!("/run/user/{}/ssh-agent.socket", unsafe { libc::getuid() });
@@ -207,5 +281,7 @@ fn main() {
         setup(verbose);
     } else if args.contains(&"--login".to_string()) {
         login(verbose);
+    } else {
+        println!("Usage: tpm2ssh [--setup | --login] [-v | --verbose]");
     }
 }
